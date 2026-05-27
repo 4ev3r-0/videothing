@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Video Call</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { font-family: Arial; background: #1a1a2e; color: white; text-align: center; margin: 0; padding: 20px; }
+        #roomControl { margin-bottom: 20px; }
+        input, button { padding: 12px; margin: 5px; font-size: 16px; border-radius: 8px; border: none; }
+        button { background: #0f3460; color: white; cursor: pointer; }
+        button:hover { background: #16213e; }
+        #videosContainer { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; }
+        video { width: 300px; background: black; margin: 5px; border-radius: 12px; transform: scaleX(-1); }
+        .controls { margin-top: 20px; }
+        .controls button { background: #e94560; }
+        .status { font-size: 14px; margin-top: 15px; color: #aaa; }
+        @media (max-width: 700px) { video { width: 200px; } }
+    </style>
+</head>
+<body>
+    <h2>📡 Low-Bandwidth Video Call</h2>
+    <div id="roomControl">
+        <input type="text" id="roomName" placeholder="Room name" value="myroom">
+        <button id="joinBtn">Join / Create Room</button>
+        <button id="leaveBtn" disabled>Leave Call</button>
+    </div>
+    <div id="videosContainer"></div>
+    <div class="controls">
+        <button id="muteAudioBtn">🔇 Mute Mic</button>
+        <button id="muteVideoBtn">📷 Stop Video</button>
+    </div>
+    <div class="status" id="status">Not connected. Enter room name and click Join.</div>
+
+    <!-- Firebase SDK -->
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-database-compat.js"></script>
+    <!-- Your Firebase config (you will create this file next) -->
+    <script src="firebase-config.js"></script>
+    
+    <script>
+        // Initialize Firebase
+        firebase.initializeApp(firebaseConfig);
+        const database = firebase.database();
+
+        let localStream = null;
+        let peers = {};
+        let roomRef = null;
+        let currentRoom = null;
+        let isInCall = false;
+        let myId = null;
+
+        const roomNameInput = document.getElementById('roomName');
+        const joinBtn = document.getElementById('joinBtn');
+        const leaveBtn = document.getElementById('leaveBtn');
+        const muteAudioBtn = document.getElementById('muteAudioBtn');
+        const muteVideoBtn = document.getElementById('muteVideoBtn');
+        const videosContainer = document.getElementById('videosContainer');
+        const statusDiv = document.getElementById('status');
+
+        function setStatus(msg) { statusDiv.innerText = msg; }
+
+        function addVideoElement(userId, isLocal = false) {
+            let videoId = isLocal ? 'localVideo' : `video_${userId}`;
+            if (document.getElementById(videoId)) return;
+            const video = document.createElement('video');
+            video.id = videoId;
+            video.autoplay = true;
+            video.playsInline = true;
+            video.muted = isLocal;
+            if (isLocal) video.style.border = "2px solid green";
+            videosContainer.appendChild(video);
+            return video;
+        }
+
+        function removeVideoElement(userId) {
+            const el = document.getElementById(`video_${userId}`);
+            if (el) el.remove();
+        }
+
+        async function getLocalStream() {
+            try {
+                const constraints = {
+                    audio: true,
+                    video: {
+                        width: { ideal: 320, max: 640 },
+                        height: { ideal: 240, max: 480 },
+                        frameRate: { ideal: 15, max: 20 }
+                    }
+                };
+                const stream = await navigator.mediaDevices.getUserMedia(constraints);
+                return stream;
+            } catch (err) {
+                console.warn("Video failed, trying audio only", err);
+                try {
+                    const audioOnly = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+                    return audioOnly;
+                } catch (e) {
+                    setStatus("Error: Cannot access camera/mic. Check permissions.");
+                    throw e;
+                }
+            }
+        }
+
+        function createPeerConnection(userId) {
+            const configuration = {
+                iceServers: [
+                    { urls: 'stun:stun.l.google.com:19302' },
+                    { urls: 'stun:stun1.l.google.com:19302' }
+                ],
+                iceCandidatePoolSize: 5
+            };
+            const pc = new RTCPeerConnection(configuration);
+
+            if (localStream) {
+                localStream.getTracks().forEach(track => {
+                    pc.addTrack(track, localStream);
+                });
+            }
+
+            pc.ontrack = (event) => {
+                let videoEl = document.getElementById(`video_${userId}`);
+                if (!videoEl) {
+                    videoEl = addVideoElement(userId, false);
+                }
+                videoEl.srcObject = event.streams[0];
+            };
+
+            pc.onicecandidate = (event) => {
+                if (event.candidate && roomRef) {
+                    roomRef.child('signaling').child(userId).set({
+                        candidate: event.candidate,
+                        from: myId
+                    });
+                }
+            };
+
+            pc.onconnectionstatechange = () => {
+                if (pc.connectionState === 'connected') {
+                    setStatus(`Connected to ${userId}`);
+                } else if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+                    setStatus(`Poor connection to ${userId}. Try turning off video.`);
+                }
+            };
+            return pc;
+        }
+
+        async function joinRoom() {
+            if (isInCall) await leaveRoom();
+            const roomName = roomNameInput.value.trim();
+            if (!roomName) return;
+
+            setStatus("Requesting camera/mic...");
+            try {
+                localStream = await getLocalStream();
+                const localVideo = addVideoElement('local', true);
+                localVideo.srcObject = localStream;
+            } catch(e) {
+                setStatus("Cannot access media devices.");
+                return;
+            }
+
+            currentRoom = roomName;
+            roomRef = database.ref(`rooms/${roomName}`);
+            myId = Math.random().toString(36).substring(2, 8);
+            setStatus("Joining room...");
+
+            // Register myself
+            await roomRef.child('participants').child(myId).set({ joined: firebase.database.ServerValue.TIMESTAMP });
+
+            // When a new participant joins
+            roomRef.child('participants').on('child_added', async (snap) => {
+                const peerId = snap.key;
+                if (peerId === myId) return;
+                if (!peers[peerId]) {
+                    setStatus(`User ${peerId} joined, connecting...`);
+                    const pc = createPeerConnection(peerId);
+                    peers[peerId] = pc;
+
+                    // Create and send offer
+                    const offer = await pc.createOffer();
+                    await pc.setLocalDescription(offer);
+                    await roomRef.child('offers').child(peerId).set({ from: myId, sdp: offer.sdp });
+                }
+            });
+
+            // Listen for offers
+            roomRef.child('offers').on('child_added', async (snap) => {
+                const data = snap.val();
+                if (data.from === myId) return;
+                const peerId = data.from;
+                if (!peers[peerId]) {
+                    const pc = createPeerConnection(peerId);
+                    peers[peerId] = pc;
+                    await pc.setRemoteDescription({ type: 'offer', sdp: data.sdp });
+                    const answer = await pc.createAnswer();
+                    await pc.setLocalDescription(answer);
+                    await roomRef.child('answers').child(peerId).set({ from: myId, sdp: answer.sdp });
+                }
+                snap.ref.remove();
+            });
+
+            // Listen for answers
+            roomRef.child('answers').on('child_added', async (snap) => {
+                const data = snap.val();
+                if (data.from === myId) return;
+                const pc = peers[data.from];
+                if (pc && pc.signalingState !== 'closed') {
+                    await pc.setRemoteDescription({ type: 'answer', sdp: data.sdp });
+                }
+                snap.ref.remove();
+            });
+
+            // Listen for ICE candidates
+            roomRef.child('signaling').on('child_added', async (snap) => {
+                const data = snap.val();
+                if (data.from === myId) return;
+                const pc = peers[data.from];
+                if (pc && data.candidate) {
+                    try {
+                        await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+                    } catch(e) { console.warn("ICE error", e); }
+                }
+                snap.ref.remove();
+            });
+
+            window.addEventListener('beforeunload', () => leaveRoom());
+            isInCall = true;
+            joinBtn.disabled = true;
+            leaveBtn.disabled = false;
+            setStatus(`In room: ${roomName}. Share the room name with others.`);
+        }
+
+        async function leaveRoom() {
+            if (roomRef) {
+                await roomRef.child('participants').child(myId).remove();
+                roomRef.off();
+                roomRef = null;
+            }
+            for (let id in peers) {
+                if (peers[id]) peers[id].close();
+                removeVideoElement(id);
+            }
+            peers = {};
+            if (localStream) {
+                localStream.getTracks().forEach(track => track.stop());
+                localStream = null;
+            }
+            const localVideo = document.getElementById('localVideo');
+            if (localVideo) localVideo.remove();
+            isInCall = false;
+            joinBtn.disabled = false;
+            leaveBtn.disabled = true;
+            setStatus("Left the call. Refresh page if issues occur.");
+        }
+
+        function toggleAudio() {
+            if (localStream) {
+                const audioTracks = localStream.getAudioTracks();
+                if (audioTracks.length) {
+                    const enabled = !audioTracks[0].enabled;
+                    audioTracks[0].enabled = enabled;
+                    muteAudioBtn.innerText = enabled ? "🔇 Mute Mic" : "🎤 Unmute";
+                }
+            }
+        }
+
+        function toggleVideo() {
+            if (localStream) {
+                const videoTracks = localStream.getVideoTracks();
+                if (videoTracks.length) {
+                    const enabled = !videoTracks[0].enabled;
+                    videoTracks[0].enabled = enabled;
+                    muteVideoBtn.innerText = enabled ? "📷 Stop Video" : "🎥 Start Video";
+                    setStatus(enabled ? "Video on (uses more bandwidth)" : "Video off - better for poor Wi-Fi");
+                } else {
+                    setStatus("No video track to toggle");
+                }
+            }
+        }
+
+        joinBtn.onclick = joinRoom;
+        leaveBtn.onclick = leaveRoom;
+        muteAudioBtn.onclick = toggleAudio;
+        muteVideoBtn.onclick = toggleVideo;
+    </script>
+</body>
+</html>
