@@ -19,7 +19,7 @@
     </style>
 </head>
 <body>
-    <h2>📡 Low-Bandwidth Video Call (TURN enabled)</h2>
+    <h2>📡 Low-Bandwidth Video Call</h2>
     <div id="roomControl">
         <input type="text" id="roomName" placeholder="Room name" value="myroom">
         <button id="joinBtn">Join / Create Room</button>
@@ -32,20 +32,33 @@
     </div>
     <div class="status" id="status">Not connected. Enter room name and click Join.</div>
 
+    <!-- Firebase SDK -->
     <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js"></script>
     <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-database-compat.js"></script>
-    <script src="firebase-config.js"></script>
     
     <script>
+        // ========== REPLACE WITH YOUR FIREBASE CONFIG ==========
+        const firebaseConfig = {
+            apiKey: "AIzaSy...",            // <-- YOUR REAL API KEY
+            authDomain: "yourproject.firebaseapp.com",
+            databaseURL: "https://yourproject.firebaseio.com",
+            projectId: "yourproject",
+            storageBucket: "yourproject.appspot.com",
+            messagingSenderId: "123456789",
+            appId: "1:123456789:web:abcdef"
+        };
+        // ======================================================
+
         firebase.initializeApp(firebaseConfig);
         const db = firebase.database();
 
         let localStream = null;
-        let peers = {};
+        let peers = new Map();  // userId -> { pc, polite }
         let roomRef = null;
         let myId = null;
         let isInCall = false;
 
+        // DOM elements
         const roomNameInput = document.getElementById('roomName');
         const joinBtn = document.getElementById('joinBtn');
         const leaveBtn = document.getElementById('leaveBtn');
@@ -54,11 +67,11 @@
         const videosContainer = document.getElementById('videosContainer');
         const statusDiv = document.getElementById('status');
 
-        function setStatus(msg) { statusDiv.innerText = msg; }
+        function setStatus(msg) { statusDiv.innerText = msg; console.log(msg); }
 
         function addVideoElement(userId, isLocal = false) {
             let videoId = isLocal ? 'localVideo' : `video_${userId}`;
-            if (document.getElementById(videoId)) return;
+            if (document.getElementById(videoId)) return document.getElementById(videoId);
             const video = document.createElement('video');
             video.id = videoId;
             video.autoplay = true;
@@ -76,6 +89,7 @@
 
         async function getLocalStream() {
             try {
+                // Low-bandwidth constraints
                 const constraints = {
                     audio: true,
                     video: {
@@ -91,14 +105,11 @@
             }
         }
 
-        async function createPeerConnection(userId, isPolite) {
+        async function createPeerConnection(userId, polite) {
             const pc = new RTCPeerConnection({
                 iceServers: [
                     { urls: 'stun:stun.l.google.com:19302' },
-                    { urls: 'stun:stun1.l.google.com:19302' },
-                    { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
-                    { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
-                    { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
+                    { urls: 'stun:stun1.l.google.com:19302' }
                 ]
             });
 
@@ -107,14 +118,15 @@
             }
 
             pc.ontrack = (event) => {
-                let videoEl = document.getElementById(`video_${userId}`);
-                if (!videoEl) videoEl = addVideoElement(userId, false);
+                const videoEl = addVideoElement(userId, false);
                 videoEl.srcObject = event.streams[0];
+                setStatus(`Receiving video from ${userId}`);
             };
 
             pc.onicecandidate = (event) => {
-                if (event.candidate) {
-                    db.ref(`rooms/${roomNameInput.value}/candidates/${userId}`).push({
+                if (event.candidate && roomRef) {
+                    // Store candidate in Firebase, separate from the main signaling
+                    roomRef.child('candidates').child(userId).push({
                         candidate: event.candidate,
                         from: myId
                     });
@@ -125,65 +137,94 @@
                 if (pc.iceConnectionState === 'connected') {
                     setStatus(`Connected to ${userId}`);
                 } else if (pc.iceConnectionState === 'failed') {
-                    setStatus(`Connection failed. Try audio-only or different network.`);
+                    setStatus(`Connection to ${userId} failed. Try turning off video.`);
                 }
             };
 
+            // ----- Polite negotiation handling (prevents collisions) -----
             let makingOffer = false;
+            let ignoreOffer = false;
+
             pc.onnegotiationneeded = async () => {
                 try {
                     makingOffer = true;
                     await pc.setLocalDescription(await pc.createOffer());
-                    await db.ref(`rooms/${roomNameInput.value}/offers/${userId}`).set({
+                    // Send offer to the specific peer via Firebase
+                    await roomRef.child('offers').child(userId).set({
                         from: myId,
                         sdp: pc.localDescription
                     });
                 } catch (err) {
-                    console.error(err);
+                    console.error("Negotiation needed error", err);
                 } finally {
                     makingOffer = false;
                 }
             };
 
-            const offerRef = db.ref(`rooms/${roomNameInput.value}/offers/${userId}`);
-            offerRef.on('value', async (snap) => {
+            // Listen for remote offers on this peer's dedicated path
+            const offerRef = roomRef.child('offers').child(userId);
+            const onOffer = async (snap) => {
                 const data = snap.val();
                 if (!data || data.from === myId) return;
+                // If we are polite and already making an offer or signaling busy, ignore this offer
+                if (polite && (makingOffer || pc.signalingState !== 'stable')) {
+                    ignoreOffer = true;
+                    return;
+                }
                 try {
                     await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
                     if (pc.remoteDescription.type === 'offer') {
                         await pc.setLocalDescription(await pc.createAnswer());
-                        await db.ref(`rooms/${roomNameInput.value}/answers/${userId}`).set({
+                        await roomRef.child('answers').child(userId).set({
                             from: myId,
                             sdp: pc.localDescription
                         });
                     }
                 } catch (err) {
-                    console.error(err);
+                    console.error("Offer handling error", err);
+                } finally {
+                    ignoreOffer = false;
                 }
-            });
+            };
+            offerRef.on('value', onOffer);
 
-            const answerRef = db.ref(`rooms/${roomNameInput.value}/answers/${userId}`);
-            answerRef.on('value', async (snap) => {
+            // Listen for remote answers
+            const answerRef = roomRef.child('answers').child(userId);
+            const onAnswer = async (snap) => {
                 const data = snap.val();
                 if (!data || data.from === myId) return;
                 if (pc.signalingState === 'have-local-offer') {
                     await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
                 }
+                // Clean up answer after using
                 snap.ref.remove();
-            });
+            };
+            answerRef.on('value', onAnswer);
 
-            const candidateRef = db.ref(`rooms/${roomNameInput.value}/candidates/${userId}`);
-            candidateRef.on('child_added', async (snap) => {
+            // Listen for ICE candidates for this peer
+            const candidateRef = roomRef.child('candidates').child(userId);
+            const onCandidate = async (snap) => {
                 const data = snap.val();
-                if (data.from === myId) return;
-                try {
-                    await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
-                } catch (err) {
-                    console.warn("ICE failed", err);
+                if (!data || data.from === myId) return;
+                if (data.candidate) {
+                    try {
+                        // Ensure candidate has proper sdpMid/sdpMLineIndex (fallback if missing)
+                        const candidate = new RTCIceCandidate(data.candidate);
+                        await pc.addIceCandidate(candidate);
+                    } catch (err) {
+                        console.warn("Failed to add ICE candidate", err);
+                    }
                 }
-                snap.ref.remove();
-            });
+                snap.ref.remove(); // remove after use
+            };
+            candidateRef.on('child_added', onCandidate);
+
+            // Store cleanup functions on the pc object so we can remove listeners later
+            pc._cleanup = () => {
+                offerRef.off('value', onOffer);
+                answerRef.off('value', onAnswer);
+                candidateRef.off('child_added', onCandidate);
+            };
 
             return pc;
         }
@@ -198,56 +239,63 @@
                 localStream = await getLocalStream();
                 addVideoElement('local', true).srcObject = localStream;
             } catch (e) {
-                setStatus("No media devices.");
+                setStatus("Cannot access media devices.");
                 return;
             }
 
-            myId = Math.random().toString(36).substring(2, 8);
+            myId = Math.random().toString(36).substring(2, 10);
             roomRef = db.ref(`rooms/${roomName}`);
             setStatus("Joining room...");
 
+            // Register myself in participants list
             await roomRef.child('participants').child(myId).set(true);
+            // When someone leaves
+            roomRef.child('participants').on('child_removed', (snap) => {
+                const peerId = snap.key;
+                if (peerId !== myId && peers.has(peerId)) {
+                    const peer = peers.get(peerId);
+                    peer.pc.close();
+                    if (peer.pc._cleanup) peer.pc._cleanup();
+                    peers.delete(peerId);
+                    removeVideoElement(peerId);
+                    setStatus(`${peerId} left the call.`);
+                }
+            });
+
+            // When a new participant joins
             roomRef.child('participants').on('child_added', async (snap) => {
                 const peerId = snap.key;
                 if (peerId === myId) return;
-                if (!peers[peerId]) {
-                    setStatus(`Connecting to ${peerId}...`);
-                    const isPolite = peerId < myId;
-                    const pc = await createPeerConnection(peerId, isPolite);
-                    peers[peerId] = pc;
+                if (!peers.has(peerId)) {
+                    setStatus(`New user ${peerId} joined. Connecting...`);
+                    const polite = (myId < peerId); // lexical ordering to decide who is polite
+                    const pc = await createPeerConnection(peerId, polite);
+                    peers.set(peerId, { pc, polite });
+                    // Trigger initial negotiation if stable
                     if (pc.signalingState === 'stable') {
                         pc.onnegotiationneeded();
                     }
                 }
             });
 
-            roomRef.child('participants').on('child_removed', (snap) => {
-                const peerId = snap.key;
-                if (peers[peerId]) {
-                    peers[peerId].close();
-                    delete peers[peerId];
-                    removeVideoElement(peerId);
-                    setStatus(`${peerId} left.`);
-                }
-            });
-
             isInCall = true;
             joinBtn.disabled = true;
             leaveBtn.disabled = false;
-            setStatus(`In room "${roomName}". Share room name.`);
+            setStatus(`In room "${roomName}". Share this room name with others.`);
         }
 
         async function leaveRoom() {
             if (roomRef) {
                 await roomRef.child('participants').child(myId).remove();
-                roomRef.off();
+                roomRef.off(); // remove all listeners
                 roomRef = null;
             }
-            for (let id in peers) {
-                peers[id].close();
-                removeVideoElement(id);
+            for (let [peerId, peer] of peers.entries()) {
+                peer.pc.close();
+                if (peer.pc._cleanup) peer.pc._cleanup();
+                removeVideoElement(peerId);
             }
-            peers = {};
+            peers.clear();
             if (localStream) {
                 localStream.getTracks().forEach(t => t.stop());
                 localStream = null;
@@ -257,7 +305,7 @@
             isInCall = false;
             joinBtn.disabled = false;
             leaveBtn.disabled = true;
-            setStatus("Left call.");
+            setStatus("Left the call. Refresh if issues persist.");
         }
 
         function toggleAudio() {
@@ -276,7 +324,7 @@
                 if (video) {
                     video.enabled = !video.enabled;
                     muteVideoBtn.innerText = video.enabled ? "📷 Stop Video" : "🎥 Start Video";
-                    setStatus(video.enabled ? "Video on" : "Video off - better for poor Wi-Fi");
+                    setStatus(video.enabled ? "Video on (uses more bandwidth)" : "Video off - better for poor Wi-Fi");
                 }
             }
         }
