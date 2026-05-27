@@ -19,7 +19,7 @@
     </style>
 </head>
 <body>
-    <h2>📡 Low-Bandwidth Video Call</h2>
+    <h2>📡 Low-Bandwidth Video Call (TURN enabled)</h2>
     <div id="roomControl">
         <input type="text" id="roomName" placeholder="Room name" value="myroom">
         <button id="joinBtn">Join / Create Room</button>
@@ -86,14 +86,20 @@
                 };
                 return await navigator.mediaDevices.getUserMedia(constraints);
             } catch (err) {
-                setStatus("Camera/mic access denied or failed. Audio only.");
+                setStatus("Camera/mic access denied. Audio only.");
                 return await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
             }
         }
 
         async function createPeerConnection(userId, isPolite) {
             const pc = new RTCPeerConnection({
-                iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+                iceServers: [
+                    { urls: 'stun:stun.l.google.com:19302' },
+                    { urls: 'stun:stun1.l.google.com:19302' },
+                    { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+                    { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+                    { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
+                ]
             });
 
             if (localStream) {
@@ -119,14 +125,11 @@
                 if (pc.iceConnectionState === 'connected') {
                     setStatus(`Connected to ${userId}`);
                 } else if (pc.iceConnectionState === 'failed') {
-                    setStatus(`Connection failed. Try turning off video.`);
+                    setStatus(`Connection failed. Try audio-only or different network.`);
                 }
             };
 
-            // Polite negotiation handling
             let makingOffer = false;
-            let ignoreOffer = false;
-
             pc.onnegotiationneeded = async () => {
                 try {
                     makingOffer = true;
@@ -142,21 +145,10 @@
                 }
             };
 
-            pc.onsignalingstatechange = () => {
-                if (pc.signalingState === 'stable' && !makingOffer) {
-                    // ready
-                }
-            };
-
-            // Listen for remote offers
             const offerRef = db.ref(`rooms/${roomNameInput.value}/offers/${userId}`);
             offerRef.on('value', async (snap) => {
                 const data = snap.val();
                 if (!data || data.from === myId) return;
-                if (isPolite && (makingOffer || pc.signalingState !== 'stable')) {
-                    ignoreOffer = true;
-                    return;
-                }
                 try {
                     await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
                     if (pc.remoteDescription.type === 'offer') {
@@ -168,12 +160,9 @@
                     }
                 } catch (err) {
                     console.error(err);
-                } finally {
-                    ignoreOffer = false;
                 }
             });
 
-            // Listen for remote answers
             const answerRef = db.ref(`rooms/${roomNameInput.value}/answers/${userId}`);
             answerRef.on('value', async (snap) => {
                 const data = snap.val();
@@ -184,7 +173,6 @@
                 snap.ref.remove();
             });
 
-            // Listen for ICE candidates
             const candidateRef = db.ref(`rooms/${roomNameInput.value}/candidates/${userId}`);
             candidateRef.on('child_added', async (snap) => {
                 const data = snap.val();
@@ -224,10 +212,9 @@
                 if (peerId === myId) return;
                 if (!peers[peerId]) {
                     setStatus(`Connecting to ${peerId}...`);
-                    const isPolite = peerId < myId; // determine who is polite
+                    const isPolite = peerId < myId;
                     const pc = await createPeerConnection(peerId, isPolite);
                     peers[peerId] = pc;
-                    // Trigger negotiation if needed
                     if (pc.signalingState === 'stable') {
                         pc.onnegotiationneeded();
                     }
@@ -240,14 +227,14 @@
                     peers[peerId].close();
                     delete peers[peerId];
                     removeVideoElement(peerId);
-                    setStatus(`${peerId} left the call.`);
+                    setStatus(`${peerId} left.`);
                 }
             });
 
             isInCall = true;
             joinBtn.disabled = true;
             leaveBtn.disabled = false;
-            setStatus(`In room "${roomName}". Share the room name.`);
+            setStatus(`In room "${roomName}". Share room name.`);
         }
 
         async function leaveRoom() {
@@ -270,7 +257,7 @@
             isInCall = false;
             joinBtn.disabled = false;
             leaveBtn.disabled = true;
-            setStatus("Left the call.");
+            setStatus("Left call.");
         }
 
         function toggleAudio() {
